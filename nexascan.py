@@ -108,21 +108,68 @@ def http_get(url, timeout=12, headers=None):
 # --------------------------------------------------------------------------- #
 #  Modules — each returns a list of finding dicts
 # --------------------------------------------------------------------------- #
+def _add_sub(name, domain, subs):
+    name = name.strip().lstrip("*.").lower()
+    if name.endswith(domain) and re.match(r"^[a-z0-9.\-]+$", name):
+        subs.add(name)
+
+
 def mod_subdomains(domain, scope, log):
-    log("subdomains", "querying crt.sh (passive)")
-    url = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
+    """Passive CT-log enumeration. crt.sh is flaky under load, so we retry
+    with a browser-like UA and fall back to certspotter."""
+    browser_ua = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
     subs = set()
-    try:
-        _, _, body = http_get(url, timeout=40)
-        for entry in json.loads(body or "[]"):
+
+    # --- source 1: crt.sh, with retries ---
+    crt = f"https://crt.sh/?q=%25.{urllib.parse.quote(domain)}&output=json"
+    for attempt in range(1, 4):
+        log("subdomains", f"crt.sh attempt {attempt}/3")
+        status, _, body = http_get(crt, timeout=40, headers={"User-Agent": browser_ua})
+        body = (body or "").strip()
+        if not body:
+            time.sleep(2 * attempt)
+            continue
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            # crt.sh sometimes streams newline-delimited objects or an HTML error
+            if body.lstrip().startswith("<"):
+                time.sleep(2 * attempt)
+                continue
+            data = []
+            for line in body.splitlines():
+                line = line.strip().rstrip(",")
+                if line.startswith("{"):
+                    try:
+                        data.append(json.loads(line))
+                    except Exception:
+                        pass
+        for entry in data:
             for name in str(entry.get("name_value", "")).splitlines():
-                name = name.strip().lstrip("*.").lower()
-                if name.endswith(domain) and re.match(r"^[a-z0-9.\-]+$", name):
-                    subs.add(name)
-    except Exception as e:
-        log("subdomains", f"error: {e}")
+                _add_sub(name, domain, subs)
+        if subs:
+            break
+        time.sleep(2 * attempt)
+
+    # --- source 2: certspotter fallback ---
+    if not subs:
+        log("subdomains", "crt.sh empty — trying certspotter")
+        cs = (f"https://api.certspotter.com/v1/issuances?domain={urllib.parse.quote(domain)}"
+              "&include_subdomains=true&expand=dns_names")
+        _, _, body = http_get(cs, timeout=30, headers={"User-Agent": browser_ua})
+        try:
+            for entry in json.loads(body or "[]"):
+                for name in entry.get("dns_names", []):
+                    _add_sub(name, domain, subs)
+        except Exception as e:
+            log("subdomains", f"certspotter error: {e}")
+
     subs = sorted(s for s in subs if scope.allows(s))
-    log("subdomains", f"{len(subs)} in-scope subdomains")
+    if not subs:
+        log("subdomains", "0 found (CT sources rate-limited or no certs) — continuing")
+    else:
+        log("subdomains", f"{len(subs)} in-scope subdomains")
     return subs, [{"severity": "INFO", "type": "subdomain", "target": s,
                    "detail": "discovered via CT logs"} for s in subs]
 
