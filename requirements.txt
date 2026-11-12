@@ -1,0 +1,4 @@
+# Core runs on the Python standard library alone.
+# Optional — enables DNS record enumeration + AXFR zone-transfer checks:
+dnspython>=2.3
+# Python 3.8+
